@@ -5,7 +5,7 @@ import {
   List, ListItem, ListItemText, Stack, Paper, Alert
 } from "@mui/material";
 
-const API =  "http://127.0.0.1:4000";
+const API = import.meta.env.VITE_API_BASE; 
 
 export default function App() {
   const [bets,setBets] = useState([]);
@@ -14,26 +14,23 @@ export default function App() {
   const [status,setStatus] = useState("connecting");
 
   const socket = useMemo(() => io(API, {
-    path: "/socket.io",          // sin barra final
-    withCredentials: false,      // no cookies
-    reconnection: true,
-    reconnectionAttempts: Infinity,
-    reconnectionDelay: 1000,
-    reconnectionDelayMax: 5000
-  }), []);
+    path: "/socket.io/",
+    reconnection: true
+  }), [API]);
 
-  useEffect(()=>{
-    fetch(`${API}/api/bets`).then(r=>r.json()).then(setBets).catch(()=>{});
+  useEffect(() => {
+    fetch(`${API}/api/bets`)
+      .then(r=>r.json())
+      .then(setBets)
+      .catch(()=>{});
     socket.on("connect", ()=> setStatus("connected"));
     socket.on("disconnect", ()=> setStatus("reconnecting"));
     socket.on("reconnect", ()=> setStatus("connected"));
-    socket.on("bet:new",(b)=> setBets(prev=>[b,...prev].slice(0,100)));
-    return ()=> socket.close();
-  },[]);
+    socket.on("bet:new", b => setBets(prev => [b, ...prev].slice(0,100)));
+    return () => socket.close();
+  }, [API, socket]);
 
-  const place = async () => {
-    socket.emit("bet:place",{ user, amount, round: "R1" });
-  };
+  const place = () => socket.emit("bet:place",{ user, amount, round:"R1" });
 
   return (
     <Container maxWidth="sm" sx={{ py: 4 }}>

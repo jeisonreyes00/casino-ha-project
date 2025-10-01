@@ -7,6 +7,19 @@ import { Server } from "socket.io";
 import { createClient } from "redis";
 import { createAdapter } from "@socket.io/redis-adapter";
 import modelsFactory from "./models.js";
+import client from "prom-client";
+client.collectDefaultMetrics(); // CPU, memoria, event loop
+
+const betsTotal   = new client.Counter({ name: "bets_total", help: "Apuestas creadas" });
+const betsErrors  = new client.Counter({ name: "bets_errors_total", help: "Errores al crear apuesta" });
+const betsLatency = new client.Histogram({
+  name: "bet_process_ms",
+  help: "Tiempo de procesamiento de POST /api/bets",
+  buckets: [10, 25, 50, 100, 200, 500, 1000]
+});
+const wsClients = new client.Gauge({ name: "ws_clients", help: "Conexiones WebSocket activas" });
+
+
 
 const PORT = process.env.PORT || 4000;
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -20,6 +33,12 @@ if (!MONGODB_URI) {
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// endpoint de métricas
+app.get("/metrics", async (_req, res) => {
+  res.set("Content-Type", client.register.contentType);
+  res.end(await client.register.metrics());
+});
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -48,7 +67,6 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/api/bets", async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "50", 10), 200);
   const docs = await Bet.find().sort({ createdAt: -1 }).limit(limit).lean();
-  // Decimal128 -> string for JSON
   docs.forEach(d => {
     if (d.amount) d.amount = d.amount.toString();
     if (d.payout) d.payout = d.payout.toString();
@@ -57,17 +75,29 @@ app.get("/api/bets", async (req, res) => {
 });
 
 app.post("/api/bets", async (req, res) => {
-  const { user, amount, round } = req.body || {};
-  if (!user || amount == null) return res.status(400).json({ error: "user y amount requeridos" });
-  const bet = await Bet.create({
-    user,
-    amount: mongoose.Types.Decimal128.fromString(String(amount)),
-    round: round || "R1",
-    status: "placed"
-  });
-  const payload = { ...bet.toObject(), amount: bet.amount.toString() };
-  io.emit("bet:new", payload);
-  res.status(201).json(payload);
+  const end = betsLatency.startTimer(); // --- métrica de latencia ---
+  try {
+    const { user, amount, round } = req.body || {};
+    if (!user || amount == null) {
+      betsErrors.inc();
+      return res.status(400).json({ error: "user y amount requeridos" });
+    }
+    const bet = await Bet.create({
+      user,
+      amount: mongoose.Types.Decimal128.fromString(String(amount)),
+      round: round || "R1",
+      status: "placed"
+    });
+    betsTotal.inc(); // --- contador de apuestas ---
+    const payload = { ...bet.toObject(), amount: bet.amount.toString() };
+    io.emit("bet:new", payload);
+    res.status(201).json(payload);
+  } catch (e) {
+    betsErrors.inc();
+    res.status(500).json({ error: "fail", detail: e.message });
+  } finally {
+    end(); // ---- fin métrica de latencia ----
+  }
 });
 
 // Open/close round endpoints (simple demo)
@@ -81,7 +111,13 @@ app.post("/api/rounds/close", async (req, res) => {
   const { code, crashMultiplier } = req.body || {};
   const r = await Round.findOneAndUpdate(
     { code },
-    { state: "closed", closedAt: new Date(), crashMultiplier: crashMultiplier ? mongoose.Types.Decimal128.fromString(String(crashMultiplier)) : undefined },
+    {
+      state: "closed",
+      closedAt: new Date(),
+      crashMultiplier: crashMultiplier
+        ? mongoose.Types.Decimal128.fromString(String(crashMultiplier))
+        : undefined
+    },
     { new: true }
   );
   res.json(r);
@@ -89,7 +125,10 @@ app.post("/api/rounds/close", async (req, res) => {
 
 // Socket.IO handlers
 io.on("connection", (socket) => {
+  wsClients.inc();                      // --- gauge WS ---
   socket.emit("hello", { id: socket.id });
+  socket.on("disconnect", () => wsClients.dec());
+
   socket.on("bet:place", async (p) => {
     if (!p?.user || p?.amount == null) return;
     const bet = await Bet.create({
