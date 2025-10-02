@@ -2,26 +2,65 @@ version: "3.9"
 services:
   redis:
     image: redis:7
-    ports: ["6379:6379"]
+    restart: unless-stopped
+
+  mongo1:
+    image: mongo:6
+    command: ["mongod","--replSet","rs0","--bind_ip_all"]
+    restart: unless-stopped
+    ports: ["27017:27017"]
+  mongo2:
+    image: mongo:6
+    command: ["mongod","--replSet","rs0","--bind_ip_all"]
+    restart: unless-stopped
+
+  mongo3:
+    image: mongo:6
+    command: ["mongod","--replSet","rs0","--bind_ip_all"]
+    restart: unless-stopped
+
+  mongo-init:
+    image: mongo:6
+    depends_on: [mongo1, mongo2, mongo3]
+    restart: "no"
+    entrypoint: ["bash","-lc"]
+    command: >
+      'until mongosh --host mongo1:27017 --eval "db.runCommand({ ping: 1 })" >/dev/null 2>&1; do sleep 1; done &&
+       mongosh --host mongo1:27017 --eval "
+         rs.initiate({
+           _id:\"rs0\",
+           members:[
+             {_id:0,host:\"mongo1:27017\"},
+             {_id:1,host:\"mongo2:27017\"},
+             {_id:2,host:\"mongo3:27017\"}
+           ]
+         });
+         var s; do { s = rs.status(); sleep(1000) } while(!s.members || !s.members.some(m=>m.stateStr===\"PRIMARY\"));
+         db.getSiblingDB(\"casino\").bets.createIndex({createdAt:-1});
+         db.getSiblingDB(\"casino\").bets.createIndex({user:1,createdAt:-1});
+         db.getSiblingDB(\"casino\").bets.createIndex({round:1,createdAt:-1});
+       "'
 
   api1:
     build: ./backend
     environment:
       - PORT=4000
       - REDIS_URL=redis://redis:6379
-      - MONGODB_URI=${MONGODB_URI}
-    depends_on: [redis]
+      - MONGODB_URI=mongodb://mongo1:27017,mongo2:27017,mongo3:27017/casino?replicaSet=rs0&retryWrites=true&w=majority&readPreference=secondaryPreferred
+    depends_on: [redis, mongo-init]
+    restart: unless-stopped
+
   api2:
     build: ./backend
     environment:
       - PORT=4000
       - REDIS_URL=redis://redis:6379
-      - MONGODB_URI=${MONGODB_URI}
-    depends_on: [redis]
+      - MONGODB_URI=mongodb://mongo1:27017,mongo2:27017,mongo3:27017/casino?replicaSet=rs0&retryWrites=true&w=majority&readPreference=secondaryPreferred
+    depends_on: [redis, mongo-init]
+    restart: unless-stopped
 
-  nginx:
-    image: nginx:alpine
+  web:
+    build: ./frontend
     depends_on: [api1, api2]
     ports: ["8080:80"]
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    restart: unless-stopped
